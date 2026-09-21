@@ -674,7 +674,7 @@
 <section id="page-teamprogress" class="page">
   <div class="page-header">
     <h2>Team Progress</h2>
-    <p>Task count and average progress per person, per stage.</p>
+    <p>Task count, completed count, and average progress per person — computed live from the Tasks tab.</p>
   </div>
   <div id="teamProgressList"></div>
 </section>
@@ -1445,16 +1445,21 @@ async function renderMapeTasks(){
   let items = MAPE_TASKS;
   if (term) items = items.filter(t => ((t.title||'')+' '+(t.owner||'')+' '+(t.pillar||'')+' '+(t.epic_name||'')).toLowerCase().includes(term));
 
+  const STAGE_COLORS = { Monitor:'#112A3A', Analyze:'#D94A38', Plan:'#F28C28', Execute:'#6B2D5C' };
+  const STAGE_ORDER = ['Monitor','Analyze','Plan','Execute'];
+
   const groups = {};
   items.forEach(t=>{
-    const g = t.epic_name || 'Not yet assigned to an epic';
+    const g = t.stage_name || 'Unstaged';
     if (!groups[g]) groups[g] = [];
     groups[g].push(t);
   });
   const groupNames = Object.keys(groups).sort((a,b)=>{
-    if (a==='Not yet assigned to an epic') return 1;
-    if (b==='Not yet assigned to an epic') return -1;
-    return a.localeCompare(b);
+    const ia = STAGE_ORDER.indexOf(a), ib = STAGE_ORDER.indexOf(b);
+    if (ia===-1 && ib===-1) return a.localeCompare(b);
+    if (ia===-1) return 1;
+    if (ib===-1) return -1;
+    return ia-ib;
   });
 
   let html =
@@ -1464,13 +1469,12 @@ async function renderMapeTasks(){
     html += '<div class="empty-state"><b>No mapped tasks match</b>Try a different search.</div>';
   } else {
     groupNames.forEach(g=>{
-      const color = g==='Not yet assigned to an epic' ? '#8891A0' : epicColor(g);
+      const color = STAGE_COLORS[g] || '#8891A0';
       html += '<div class="mape-group-header"><span class="epic-dot" style="background:'+color+'"></span>' + g + ' (' + groups[g].length + ')</div>';
       html += groups[g].map(t=>
         '<div class="record-row" data-id="' + t.id + '" style="border-left:3px solid '+color+';">' +
-          '<div class="record-row-top"><span class="record-row-id">' + t.id + '</span></div>' +
           '<div class="record-row-title">' + (t.title||'Untitled') + '</div>' +
-          '<div class="record-row-meta">' + metaLine([t.owner, t.stage_name, t.pillar]) + '</div>' +
+          '<div class="record-row-meta">' + metaLine([t.owner, t.pillar, t.epic_name]) + '</div>' +
         '</div>'
       ).join('');
     });
@@ -1534,58 +1538,42 @@ async function renderMilestones(){
 async function renderTeamProgress(){
   const list = document.getElementById('teamProgressList');
   list.innerHTML = '<div class="loading-msg">Loading…</div>';
-  await loadDataset('teamProgress');
+  await Promise.all([loadDataset('tasks'), loadDataset('team')]);
 
-  list.innerHTML =
-    '<button class="reset-btn btn-primary add-btn" id="addTpBtn">+ Add row</button>' +
-    '<div id="tpFormArea"></div><div id="tpRows"></div>';
-  document.getElementById('addTpBtn').onclick = () => openRecordForm('teamProgress', 'tpFormArea', null);
+  // Computed live from Tasks — not manually entered, so this can never
+  // drift out of sync with what's actually in the Tasks tab.
+  const byAssignee = {};
+  TASKS.forEach(t=>{
+    const a = t.assignee || 'Unassigned';
+    if (!byAssignee[a]) byAssignee[a] = {total:0, completed:0, sum:0};
+    byAssignee[a].total++;
+    if (t.status === 'Completed') byAssignee[a].completed++;
+    byAssignee[a].sum += Number(t.progress_pct)||0;
+  });
 
-  const rows = document.getElementById('tpRows');
-  if (!TEAM_PROGRESS.length){
-    rows.innerHTML = '<div class="empty-state"><b>No team progress rows yet</b>Click "+ Add row" above.</div>';
+  const names = Object.keys(byAssignee).sort((a,b)=>byAssignee[b].total-byAssignee[a].total);
+
+  if (!names.length){
+    list.innerHTML = '<div class="empty-state"><b>No tasks yet</b>Team progress is computed from the Tasks tab — add tasks there to see it populate.</div>';
     return;
   }
 
-  const groups = {};
-  TEAM_PROGRESS.forEach(t=>{
-    const g = t.epic_name || 'Not yet assigned to an epic';
-    if (!groups[g]) groups[g] = [];
-    groups[g].push(t);
-  });
-  const groupNames = Object.keys(groups).sort((a,b)=>{
-    if (a==='Not yet assigned to an epic') return 1;
-    if (b==='Not yet assigned to an epic') return -1;
-    return a.localeCompare(b);
-  });
-
-  rows.innerHTML = groupNames.map(g=>{
-    const entries = groups[g];
-    const color = g==='Not yet assigned to an epic' ? '#8891A0' : epicColor(g);
-    const totalTasks = entries.reduce((s,e)=>s+(Number(e.tasks_count)||0),0);
-    const avgP = entries.length ? Math.round(entries.reduce((s,e)=>s+(Number(e.avg_progress_pct)||0),0)/entries.length*100) : 0;
-    const assignees = Array.from(new Set(entries.map(e=>e.assignee).filter(Boolean))).join(', ');
-    const achievements = entries.map(e=>e.notes).filter(Boolean);
-    return '<div class="record-row" data-group="' + g + '" style="border-left:3px solid '+color+';">' +
-      '<div class="record-row-top">' +
-        '<span class="record-row-id"><span class="epic-dot" style="background:'+color+'"></span>' + g + '</span>' +
-        '<span class="badge" style="color:var(--ink);background:var(--panel)">' + avgP + '% avg</span>' +
+  list.innerHTML = '<div class="user-card-grid" id="tpCards"></div>';
+  const cards = document.getElementById('tpCards');
+  cards.innerHTML = names.map(name=>{
+    const stats = byAssignee[name];
+    const member = TEAM.find(t=>t.name===name);
+    const avgP = stats.total ? Math.round(stats.sum/stats.total*100) : 0;
+    const color = avgP===100 ? 'var(--done)' : (avgP>0 ? 'var(--progress)' : 'var(--notstarted)');
+    return '<div class="user-card" style="border-left-color:'+color+'">' +
+      '<div class="uc-name">' + name + '</div>' +
+      '<div class="uc-role">' + (member ? member.role : '') + '</div>' +
+      '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:8px;">' +
+        '<span style="font-size:var(--text-2xs);color:var(--ink-soft);">' + stats.total + ' tasks · ' + stats.completed + ' completed</span>' +
+        '<span style="font-family:var(--font-display);font-weight:600;font-size:var(--text-base);color:'+color+';">' + avgP + '%</span>' +
       '</div>' +
-      '<div class="record-row-title">' + (assignees||'Unassigned') + '</div>' +
-      '<div class="record-row-meta">' + totalTasks + ' tasks across ' + entries.length + ' entr' + (entries.length===1?'y':'ies') + '</div>' +
-      (achievements.length ? '<ul style="margin:8px 0 0;padding-left:18px;font-size:var(--text-sm);color:var(--ink-soft);">' +
-        achievements.map(a=>'<li>'+a+'</li>').join('') + '</ul>' : '') +
     '</div>';
   }).join('');
-
-  document.querySelectorAll('#tpRows .record-row').forEach(el=>{
-    el.addEventListener('click', ()=>{
-      const g = el.getAttribute('data-group');
-      const rec = groups[g][0]; // edit the first entry in this epic's group
-      openRecordForm('teamProgress', 'tpFormArea', rec);
-      document.getElementById('tpFormArea').scrollIntoView({behavior:'smooth', block:'center'});
-    });
-  });
 }
 
 // ---------------------------------------------------------------------
