@@ -832,7 +832,6 @@ const FIELD_SCHEMAS = {
     {key:'workstream_name', label:'Epic Name', type:'text'},
     {key:'assignee', label:'Assignee', type:'text'},
     {key:'risk', label:'Risk', type:'select', options:['On Track','At Risk','Delayed','Blocked']},
-    {key:'progress_pct', label:'Progress (0–1)', type:'number'},
     {key:'last_accomplishment', label:'Last Accomplishment', type:'textarea'},
     {key:'next_step', label:'Next Step', type:'textarea'},
     {key:'notes', label:'Notes', type:'textarea'},
@@ -866,7 +865,6 @@ const FIELD_SCHEMAS = {
   milestones: [
     {key:'name', label:'Initiative / Milestone', type:'text'},
     {key:'target_date', label:'Target Date', type:'date'},
-    {key:'progress_pct', label:'Progress (0–1)', type:'number'},
     {key:'notes', label:'Notes', type:'textarea'},
   ],
   teamProgress: [
@@ -1067,6 +1065,28 @@ function pct(v){
   return Math.round(Number(v) * 100);
 }
 
+// ---------------------------------------------------------------------
+// Calculated rollups — always derived from real linked data, never from
+// a manually-typed number. An Epic's progress is the average of its own
+// Tasks; a Milestone's progress is the average of its own Epics' (also
+// calculated) progress. An epic/milestone with nothing linked yet shows
+// 0% — an honest "nothing verified" rather than a stale guess — and
+// starts calculating for real the moment tasks/epics are linked to it.
+// ---------------------------------------------------------------------
+function computeEpicProgress(epic){
+  const linked = TASKS.filter(t => t.related_workstream === epic.workstream_name);
+  if (!linked.length) return {value: 0, source:'none', count: 0};
+  const avg = linked.reduce((s,t)=>s+(Number(t.progress_pct)||0),0) / linked.length;
+  return {value: avg, source:'calculated', count: linked.length};
+}
+
+function computeMilestoneProgress(milestone){
+  const linked = EPICS.filter(e => e.milestone === milestone.name);
+  if (!linked.length) return {value: 0, source:'none', count: 0};
+  const avg = linked.reduce((s,e)=>s+computeEpicProgress(e).value,0) / linked.length;
+  return {value: avg, source:'calculated', count: linked.length};
+}
+
 function metaLine(parts){
   return parts.filter(Boolean).join(' · ');
 }
@@ -1129,7 +1149,7 @@ function overviewMetrics(){
   const highOpenRisks = RISKS.filter(r=>r.impact==='High' && ['Open','In Progress','Under Review'].includes(r.status)).length;
   const activeTeam = TEAM.filter(t=>t.active==='Yes').length;
   const avgEpicProgress = totalEpics
-    ? Math.round(EPICS.reduce((s,w)=>s+(Number(w.progress_pct)||0),0) / totalEpics * 100)
+    ? Math.round(EPICS.reduce((s,w)=>s+computeEpicProgress(w).value,0) / totalEpics * 100)
     : 0;
   const atRiskEpics = EPICS.filter(w=>['At Risk','Delayed','Blocked'].includes(w.risk)).length;
 
@@ -1198,14 +1218,15 @@ function renderRankingChart(){
     el.innerHTML = '<div class="empty-state"><b>No epics yet</b></div>';
     return;
   }
-  const sorted = EPICS.slice().sort((a,b)=>(Number(b.progress_pct)||0)-(Number(a.progress_pct)||0));
+  const sorted = EPICS.slice().sort((a,b)=>computeEpicProgress(b).value-computeEpicProgress(a).value);
   el.innerHTML = sorted.map((e, i) => {
-    const p = pct(e.progress_pct);
+    const prog = computeEpicProgress(e);
+    const p = pct(prog.value);
     const col = RISK_COLOR[e.risk] || RISK_COLOR['On Track'];
     return '<div class="rank-row">' +
       '<div class="rank-num">' + (i+1) + '</div>' +
       '<div class="rank-info">' +
-        '<div class="rank-name">' + (e.workstream_name||'Untitled') + '</div>' +
+        '<div class="rank-name">' + (e.workstream_name||'Untitled') + (prog.source==='none' ? ' <span style="font-size:var(--text-2xs);color:var(--notstarted);">(no tasks linked yet)</span>' : '') + '</div>' +
         '<div class="rank-track"><div class="rank-fill" style="width:'+p+'%;background:'+col.c+'"></div></div>' +
       '</div>' +
       '<div class="rank-pct">' + p + '%</div>' +
@@ -1258,22 +1279,24 @@ function renderTimelineChart(){
     el.innerHTML = '<div class="empty-state"><b>No milestone dates set</b>Add target dates on the Milestones tab to see the timeline.</div>';
   } else {
     const today = new Date();
-    let currentIdx = dated.findIndex(m => pct(m.progress_pct) < 100 && m.d >= today);
-    if (currentIdx === -1) currentIdx = dated.findIndex(m => pct(m.progress_pct) < 100);
+    let currentIdx = dated.findIndex(m => pct(computeMilestoneProgress(m).value) < 100 && m.d >= today);
+    if (currentIdx === -1) currentIdx = dated.findIndex(m => pct(computeMilestoneProgress(m).value) < 100);
     if (currentIdx === -1) currentIdx = dated.length; // everything crossed
 
     const nodes = dated.map((m, i) => {
+      const mProg = computeMilestoneProgress(m);
+      const mPct = pct(mProg.value);
       let cls = 'upcoming';
-      if (pct(m.progress_pct) >= 100 || i < currentIdx) cls = 'crossed';
+      if (mPct >= 100 || i < currentIdx) cls = 'crossed';
       else if (i === currentIdx) cls = 'current';
       return '<div class="stepper-node">' +
         '<div class="stepper-dot ' + cls + '">' + (cls==='crossed' ? '&#10003;' : (i+1)) + '</div>' +
         '<div class="stepper-name">' + m.name + '</div>' +
-        '<div class="stepper-date">' + m.target_date + ' · ' + pct(m.progress_pct) + '%</div>' +
+        '<div class="stepper-date">' + m.target_date + ' · ' + mPct + '%</div>' +
       '</div>';
     });
 
-    const crossedCount = dated.filter((m,i)=> pct(m.progress_pct) >= 100 || i < currentIdx).length;
+    const crossedCount = dated.filter((m,i)=> pct(computeMilestoneProgress(m).value) >= 100 || i < currentIdx).length;
     const fillPct = dated.length > 1 ? (Math.max(0, crossedCount - 1) / (dated.length - 1)) * 100 : 0;
 
     el.innerHTML =
@@ -1288,7 +1311,7 @@ function renderTimelineChart(){
     el.innerHTML += '<div style="margin-top:18px;">' +
       '<div style="font-size:var(--text-xs);font-weight:700;color:var(--ink-soft);margin-bottom:10px;">Parallel initiatives</div>' +
       parallel.map(m=>{
-        const p = pct(m.progress_pct);
+        const p = pct(computeMilestoneProgress(m).value);
         const color = p===100 ? 'var(--done)' : (p>0 ? 'var(--progress)' : 'var(--notstarted)');
         return '<div style="margin-bottom:12px;">' +
           '<div style="display:flex;justify-content:space-between;font-size:var(--text-sm);margin-bottom:4px;">' +
@@ -1311,12 +1334,12 @@ let epicsMilestoneFilter = 'All';
 async function renderEpics(){
   const list = document.getElementById('epicsList');
   list.innerHTML = '<div class="loading-msg">Loading…</div>';
-  await loadDataset('epics');
+  await Promise.all([loadDataset('epics'), loadDataset('tasks')]);
 
   const total = EPICS.length;
   const onTrack = EPICS.filter(w=>w.risk==='On Track').length;
   const atRisk = EPICS.filter(w=>['At Risk','Delayed','Blocked'].includes(w.risk)).length;
-  const avgProgress = total ? Math.round(EPICS.reduce((s,w)=>s+(Number(w.progress_pct)||0),0)/total*100) : 0;
+  const avgProgress = total ? Math.round(EPICS.reduce((s,w)=>s+computeEpicProgress(w).value,0)/total*100) : 0;
   document.getElementById('epicsKpi').innerHTML = [
     [total,'Total epics'], [onTrack,'On track'], [atRisk,'At risk / delayed / blocked'], [avgProgress+'%','Avg progress'],
   ].map(([n,l])=>'<div class="kpi-card"><div class="kpi-num">'+n+'</div><div class="kpi-label">'+l+'</div></div>').join('');
@@ -1367,19 +1390,23 @@ async function renderEpics(){
 
     rows.innerHTML = groupNames.map(g=>{
       const entries = groups[g];
-      const avgP = entries.length ? Math.round(entries.reduce((s,w)=>s+(Number(w.progress_pct)||0),0)/entries.length*100) : 0;
+      const avgP = entries.length ? Math.round(entries.reduce((s,w)=>s+computeEpicProgress(w).value,0)/entries.length*100) : 0;
       const color = g==='No milestone set' ? '#8891A0' : epicColor(g);
       return '<div class="mape-group-header"><span class="epic-dot" style="background:'+color+'"></span>' + g + ' (' + entries.length + ' epics · ' + avgP + '% avg)</div>' +
         entries.map(w=>{
           const col = RISK_COLOR[w.risk] || RISK_COLOR['On Track'];
-          const p = pct(w.progress_pct);
+          const prog = computeEpicProgress(w);
+          const p = pct(prog.value);
+          const sourceNote = prog.source==='calculated'
+            ? 'Calculated from ' + prog.count + ' task' + (prog.count===1?'':'s')
+            : 'No tasks linked yet';
           return '<div class="record-row" data-id="' + w.id + '" style="border-left:3px solid '+color+';">' +
             '<div class="record-row-top">' +
               '<span class="record-row-id">' + (w.pillar||'Epic') + '</span>' +
               '<span class="status-pill" style="color:' + col.c + ';background:' + col.bg + '">' + (w.risk||'—') + '</span>' +
             '</div>' +
             '<div class="record-row-title">' + (w.workstream_name||'Untitled') + '</div>' +
-            '<div class="record-row-meta">' + metaLine([w.pillar, w.assignee, p+'% complete']) + '</div>' +
+            '<div class="record-row-meta">' + metaLine([w.pillar, w.assignee, p+'% complete', sourceNote]) + '</div>' +
             '<div class="ws-progress-track"><div class="ws-progress-fill" style="width:'+p+'%;background:'+col.c+'"></div></div>' +
           '</div>';
         }).join('');
@@ -1514,13 +1541,13 @@ async function renderFlow(){
 
   el.innerHTML = sortedMs.map(ms=>{
     const msEpics = EPICS.filter(e=>e.milestone===ms.name);
-    const msPct = pct(ms.progress_pct);
+    const msPct = pct(computeMilestoneProgress(ms).value);
     const msColor = msPct===100 ? 'var(--done)' : (msPct>0 ? 'var(--progress)' : 'var(--notstarted)');
 
     const epicsHtml = msEpics.length ? msEpics.map(e=>{
       const eTasks = TASKS.filter(t=>t.related_workstream===e.workstream_name);
       const eCol = RISK_COLOR[e.risk] || RISK_COLOR['On Track'];
-      const ePct = pct(e.progress_pct);
+      const ePct = pct(computeEpicProgress(e).value);
 
       const tasksHtml = eTasks.length ? eTasks.map(t=>{
         const tCol = STATUS_COLOR[t.status] || STATUS_COLOR['Not Started'];
@@ -1614,7 +1641,7 @@ document.getElementById('mapeTasksSearch').addEventListener('input', (e)=>{
 async function renderMilestones(){
   const list = document.getElementById('milestonesList');
   list.innerHTML = '<div class="loading-msg">Loading…</div>';
-  await loadDataset('milestones');
+  await Promise.all([loadDataset('milestones'), loadDataset('epics'), loadDataset('tasks')]);
 
   const sorted = MILESTONES.slice().sort((a,b)=> (a.target_date||'').localeCompare(b.target_date||''));
   list.innerHTML =
@@ -1627,13 +1654,19 @@ async function renderMilestones(){
     cards.innerHTML = '<div class="empty-state"><b>No milestones yet</b>Click "+ Add milestone" above.</div>';
   } else {
     cards.innerHTML = sorted.map(m=>{
-      const p = pct(m.progress_pct);
+      const prog = computeMilestoneProgress(m);
+      const p = pct(prog.value);
       const color = p===100 ? 'var(--done)' : (p>0 ? 'var(--progress)' : 'var(--notstarted)');
+      const sourceNote = prog.source==='calculated'
+        ? 'From ' + prog.count + ' epic' + (prog.count===1?'':'s')
+        : 'No epics linked yet';
       return '<div class="milestone-card" data-id="' + m.id + '">' +
         '<div class="m-title">' + (m.name||'Untitled') + '</div>' +
         '<div class="m-date">' + (m.target_date||'No date set') + '</div>' +
         '<div class="ws-progress-track"><div class="ws-progress-fill" style="width:'+p+'%;background:'+color+'"></div></div>' +
-        '<div style="text-align:right;font-size:var(--text-2xs);color:var(--ink-soft);margin-top:4px;">' + p + '%</div>' +
+        '<div style="display:flex;justify-content:space-between;font-size:var(--text-2xs);color:var(--ink-soft);margin-top:4px;">' +
+          '<span>' + sourceNote + '</span><span>' + p + '%</span>' +
+        '</div>' +
       '</div>';
     }).join('');
     document.querySelectorAll('#msCards .milestone-card').forEach(el=>{
